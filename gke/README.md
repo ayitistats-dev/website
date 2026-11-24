@@ -71,6 +71,12 @@ You should have owner/editor role to perform the following tasks.
    # Create cluster. Run this for all the regions
    ./create_cluster.sh <ENV> <REGION> <NODES>
 
+   # (Optional) If enabling agentic apps (e.g. Discover) on this environment, configure their prerequisites (Vertex AI, Model Armor, Cloud Storage & reCAPTCHA Enterprise APIs, IAM, secrets, default Model Armor template, GCS config bucket, and Cloud Armor reCAPTCHA WAF site keys).
+   # Pass `--bucket-location us` when creating a config bucket for multi-region environments such as prod (defaults to `us-central1`).
+   # Note: For environments using MultiClusterIngress (autopush, staging, prod), also run update_config_cluster.sh
+   # (see "Update cluster config" below) so website-mci routes the configured agentic.discover.basePath to website-agentic-mcs.
+   ./setup_agentic.sh <ENV>
+
    # Deploy helm
    ../scripts/deploy_gke_helm.sh -e <ENV> -l <REGION>
    ```
@@ -85,6 +91,72 @@ You should have owner/editor role to perform the following tasks.
    # Set up multi-cluster ingress and service WITH nodejs
    ./setup_config_cluster.sh <ENV> <REGION> -n
    ```
+
+## Agentic apps / Discover runtime configuration and emergency off switch
+
+When `agentic.discover.configBucket` is set in `deploy/helm_charts/envs/<ENV>.yaml`, `./setup_agentic.sh <ENV> [--bucket-location <LOCATION>]` provisions a private, versioned GCS bucket (`gs://<CONFIG_BUCKET>`, prompting for the bucket location on initial creation if `--bucket-location` is omitted and defaulting to `us-central1`; pass `--bucket-location us` for multi-region `prod`) and seeds an initial `agent-config.json` **only when the object does not yet exist**. After initial seeding, `gs://<CONFIG_BUCKET>/agent-config.json` is the authoritative runtime configuration (no config file in Git is synced on deploy).
+
+At pod startup, the `discover` container fetches `gs://<CONFIG_BUCKET>/agent-config.json` as well as optional `gs://<CONFIG_BUCKET>/prompts/{classify,discovery,synthesis,follow_up}.md` overrides (falling back to the image's default prompts for any absent slot) and caches them in memory. Write access to `gs://<CONFIG_BUCKET>` therefore controls both runtime settings and system prompts.
+
+> **Important:** Uploading to `gs://<CONFIG_BUCKET>` should be treated as a live deployment. Even before a manual rollout, any newly scheduled pod (from autoscaling, node upgrades, or pod evictions) will read the uploaded object immediately, so never stage draft files in the bucket without immediately restarting **every** cluster in the environment.
+
+To apply a configuration update (validate against `agent-config.schema.json` in `datacommonsorg/tools`, verify JSON syntax locally, upload, and roll all regional clusters — e.g. `us-central1` for `autopush`/`staging`, or both `us-central1` and `us-west1` for `prod`):
+
+```bash
+python3 -m json.tool <LOCAL_AGENT_CONFIG_JSON> >/dev/null
+gcloud storage cp <LOCAL_AGENT_CONFIG_JSON> gs://<CONFIG_BUCKET>/agent-config.json \
+  --content-type="application/json; charset=utf-8" \
+  --project=<PROJECT_ID>
+
+for REGION in <REGIONS>; do
+  gcloud container clusters get-credentials website-${REGION} --region=${REGION} --project=<PROJECT_ID>
+  kubectl rollout restart deployment/website-agentic-apps -n website
+done
+```
+
+When agentic apps are enabled on an environment (`agentic.enabled: true`), you can disable Discover chat or take down `website-agentic-apps` (for example, during unexpected traffic spikes, runaway Gemini spend, upstream MCP/Vertex AI outages, or safety incidents) in the following ways:
+
+1. **Immediate bucket-independent override (<30 seconds via `kubectl`, no GCS dependency):**
+
+   Run against **every** regional cluster in the environment:
+
+   ```bash
+   for REGION in <REGIONS>; do
+     gcloud container clusters get-credentials website-${REGION} --region=${REGION} --project=<PROJECT_ID>
+
+     # Option A: Disable Discover chat only (keeps static UI and shared stories online, stops all Gemini/MCP calls)
+     kubectl set env deployment/website-agentic-apps -n website -c discover ENABLE_CHAT=false
+
+     # Option B: Scale down all agentic app pods immediately
+     kubectl scale deployment/website-agentic-apps -n website --replicas=0
+   done
+   ```
+
+   **Note:** While `ENABLE_CHAT` is set on the Deployment, it overrides `chat.enabled` in `gs://<CONFIG_BUCKET>/agent-config.json` (so later bucket edits will have no effect on chat availability until `ENABLE_CHAT` is cleared or overwritten by the next Cloud Deploy release). To clear the override and return control to GCS (or restore replicas after scaling down):
+
+   ```bash
+   for REGION in <REGIONS>; do
+     gcloud container clusters get-credentials website-${REGION} --region=${REGION} --project=<PROJECT_ID>
+     kubectl set env deployment/website-agentic-apps -n website -c discover ENABLE_CHAT-
+     kubectl scale deployment/website-agentic-apps -n website --replicas=2
+   done
+   ```
+
+2. **Persistent across Cloud Deploy releases (via GCS `agent-config.json` or Helm):**
+
+   - **Keep Discover UI online with chat disabled (no PR required):** Set `"chat": { "enabled": false, ... }` in `gs://<CONFIG_BUCKET>/agent-config.json` (validating with `python3 -m json.tool` first), upload to GCS, and restart `website-agentic-apps` across every regional cluster as shown above (ensure any ad-hoc `ENABLE_CHAT` env override has been cleared with `ENABLE_CHAT-`). Set `"enabled": true` and restart all clusters to restore chat.
+   - **Remove the deployment and routes (via Helm in Git):** Set `agentic.discover.enabled: false` in `deploy/helm_charts/envs/<ENV>.yaml` to remove the `discover` container and `agentic.discover.basePath` Ingress paths, or set `agentic.enabled: false` to remove the `website-agentic-apps` Deployment, `website-agentic-service` Service, and agentic Ingress paths entirely.
+
+### Cloud Armor reCAPTCHA Enterprise WAF keys
+
+`./setup_agentic.sh <ENV>` automatically invokes `./setup_recaptcha.sh <ENV>` to provision Cloud Armor reCAPTCHA Enterprise WAF keys; you can also run `./setup_recaptcha.sh <ENV>` standalone to inspect, validate, or re-run WAF key setup without touching IAM, Secret Manager, Model Armor, or GCS.
+
+When `domain` is set in `deploy/helm_charts/envs/<ENV>.yaml`, `./setup_recaptcha.sh <ENV>` enables `recaptchaenterprise.googleapis.com` and idempotently provisions two Cloud Armor WAF Web site keys scoped to `domain`:
+
+- `discover-session-waf-key` (`--integration-type=score --waf-service=ca --waf-feature=session-token`): mints and refreshes the background `recaptcha-ca-t` session cookie.
+- `discover-checkbox-waf-key` (`--integration-type=checkbox --waf-service=ca --waf-feature=action-token`): powers the fallback *"I'm not a robot"* modal checkbox (`X-Recaptcha-Token`).
+
+The script prints both site key IDs for Cloud Armor Terraform (`discover-armor-policy`) and `deploy/helm_charts/envs/<ENV>.yaml`. If `domain` is unset (e.g. internal-only environments), WAF key provisioning is skipped.
 
 ## DNS setup
 
@@ -118,11 +190,10 @@ where `<ENV>` refers to the name of the instance and `<REGION>` is the region of
 
 ## Update cluster config
 
-If multi-cluster ingress and service needs to be updated, then for each region that needs to be updated, run the following commands. The "-n" flag determines whether or not to set up a nodejs server (include "-n" to setup nodejs).
+If multi-cluster ingress, multi-cluster services, or their `BackendConfig` resources need to be updated, run the following command against the Fleet **config cluster** region (for example, `us-central1`). Pass `-n` only if the environment runs the Node.js server. By default, the script fails fast if the resolved static IP differs from a live `website-mci` IP; pass `-f` only when intentionally rotating the ingress IP.
 
 ```bash
-gcloud config set project <PROJECT>
-./update_config_cluster.sh -e <ENV> -l <REGION> -n
+./update_config_cluster.sh -e <ENV> -l <REGION>
 ```
 
 where `<ENV>` refers to the name of the instance and `<REGION>` is the region of the cluster.

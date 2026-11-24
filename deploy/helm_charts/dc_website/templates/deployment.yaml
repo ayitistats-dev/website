@@ -43,6 +43,9 @@ spec:
         cloud.google.com/gke-nodepool: {{ .Values.website.nodePool }}
       {{- end }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- if and .Values.securityContext .Values.securityContext.enabled }}
+      {{- include "dc-website.podSecurityContext" . | nindent 6 }}
+      {{- end }}
       volumes:
         - name: ingress-config
           configMap:
@@ -55,10 +58,22 @@ spec:
         - name: blocklist-svg
           configMap:
             name: blocklist-svg
+        # Gunicorn worker heartbeats and Redis TLS CA cert tempfiles write to /tmp.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+        # Fallback directory for CohortAwareFileSystemCache when Redis is unconfigured.
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 512Mi
       containers:
         - name: website
           image: "gcr.io/datcom-ci/datacommons-website{{- if .Values.website.image.tag }}:{{ .Values.website.image.tag }}{{- end }}"
           imagePullPolicy: {{ .Values.website.image.pullPolicy }}
+          {{- if and .Values.securityContext .Values.securityContext.enabled }}
+          {{- include "dc-website.containerSecurityContext" (dict "uid" 10001 "gid" 10001) | nindent 10 }}
+          {{- end }}
           args: []
           ports:
             - containerPort: 8080
@@ -89,7 +104,15 @@ spec:
             {{- end }}
             - name: blocklist-svg
               mountPath: /datacommons/svg
+            - name: tmp
+              mountPath: /tmp
+            - name: model-cache
+              mountPath: /workspace/.cache
           env:
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
             - name: FLASK_ENV
               value: {{ required "Missing: website.flaskEnv" .Values.website.flaskEnv }}
             - name: WEBSITE_HASH
@@ -178,4 +201,123 @@ spec:
             httpGet:
               path: /nodejs/healthz
               port: 8080
+{{- end }}
+
+{{- if and .Values.agentic .Values.agentic.enabled .Values.agentic.discover .Values.agentic.discover.enabled }}
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: website-agentic-apps
+  namespace: {{ .Values.namespace.name }}
+spec:
+  replicas: {{ .Values.agentic.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ div .Values.agentic.replicas 4 | add 1 }}
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: website-agentic-apps
+  template:
+    metadata:
+      labels:
+        app: website-agentic-apps
+    spec:
+      {{- if .Values.agentic.nodePool }}
+      nodeSelector:
+        cloud.google.com/gke-nodepool: {{ .Values.agentic.nodePool }}
+      {{- end }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- if and .Values.securityContext .Values.securityContext.enabled }}
+      {{- include "dc-website.podSecurityContext" . | nindent 6 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 125
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      containers:
+        {{- if .Values.agentic.discover.enabled }}
+        - name: discover
+          image: "gcr.io/datcom-ci/datacommons-discover{{- if .Values.agentic.discover.image.tag }}:{{ .Values.agentic.discover.image.tag }}{{- end }}"
+          imagePullPolicy: {{ .Values.website.image.pullPolicy }}
+          {{- if and .Values.securityContext .Values.securityContext.enabled }}
+          {{- include "dc-website.containerSecurityContext" (dict "uid" 10001 "gid" 10001) | nindent 10 }}
+          {{- end }}
+          args: []
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              memory: {{ .Values.agentic.discover.memory | quote }}
+            requests:
+              cpu: {{ .Values.agentic.discover.cpu | default "500m" | quote }}
+              memory: {{ .Values.agentic.discover.memory | quote }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PORT
+              value: "8080"
+            - name: BASE_PATH
+              value: {{ .Values.agentic.discover.basePath | quote }}
+            {{- if not (and (kindIs "string" .Values.agentic.discover.debugReport) (has .Values.agentic.discover.debugReport (list "" "off" "flag" "on"))) }}
+            {{- fail (printf "Invalid agentic.discover.debugReport %v: must be a quoted string (\"off\", \"flag\", \"on\", or \"\")" .Values.agentic.discover.debugReport) }}
+            {{- end }}
+            - name: DEBUG_REPORT
+              value: {{ .Values.agentic.discover.debugReport | quote }}
+            - name: ALLOWED_ORIGIN
+              value: "https://{{ required "Missing: domain" .Values.domain }}"
+            - name: MCP_SERVER_URL
+              value: {{ .Values.agentic.mcpServerUrl | quote }}
+            - name: GOOGLE_GENAI_USE_VERTEXAI
+              value: {{ .Values.agentic.useVertexAi | quote }}
+            - name: GOOGLE_CLOUD_PROJECT
+              value: {{ required "Missing: project" .Values.project | quote }}
+            - name: GOOGLE_CLOUD_LOCATION
+              value: {{ .Values.agentic.cloudLocation | quote }}
+            - name: DC_API_KEY_SECRET
+              value: {{ .Values.agentic.dcApiKeySecret | quote }}
+            - name: TRANSCRIPT_HMAC_SECRET_NAME
+              value: {{ .Values.agentic.transcriptHmacSecretName | quote }}
+            - name: MODEL_ARMOR_TEMPLATE
+              {{- if .Values.agentic.discover.modelArmorTemplateId }}
+              value: {{ printf "projects/%s/locations/%s/templates/%s" (required "Missing: project" .Values.project) (required "Missing: agentic.modelArmorLocation" .Values.agentic.modelArmorLocation) .Values.agentic.discover.modelArmorTemplateId | quote }}
+              {{- else }}
+              value: ""
+              {{- end }}
+            - name: CONFIG_URL
+              {{- if .Values.agentic.discover.configBucket }}
+              {{- if contains "/" .Values.agentic.discover.configBucket }}
+              {{- fail (printf "Invalid agentic.discover.configBucket %q: must be a bucket name without gs:// or '/'" .Values.agentic.discover.configBucket) }}
+              {{- end }}
+              # Object name must match DISCOVER_CONFIG_OBJECT in gke/setup_agentic.sh.
+              value: {{ printf "https://storage.googleapis.com/%s/agent-config.json" .Values.agentic.discover.configBucket | quote }}
+              {{- else }}
+              value: ""
+              {{- end }}
+          startupProbe:
+            httpGet:
+              path: {{ trimSuffix "/" .Values.agentic.discover.basePath }}/healthz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: {{ trimSuffix "/" .Values.agentic.discover.basePath }}/healthz
+              port: 8080
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: {{ trimSuffix "/" .Values.agentic.discover.basePath }}/healthz
+              port: 8080
+            periodSeconds: 10
+        {{- end }}
 {{- end }}

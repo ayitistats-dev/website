@@ -85,16 +85,16 @@
     "description": "Enables the display of an updated explore page results header."
   },
   {
-    "name": "factcheck_redirect",
-    "enabled": false,
-    "owner": "dwnoble",
-    "description": "Feature flag to redirect the Fact Check page to the new ClaimReview page."
-  },
-  {
     "name": "follow_up_questions_ga",
     "enabled": true,
     "owner": "javiervazquez",
     "description": "Enables the follow up questions generated from related topics to general audience."
+  },
+  {
+    "name": "labs_discover_menu_item",
+    "enabled": false,
+    "owner": "pablonoel",
+    "description": "Shows the Statistical Trends link (/labs/discover/) in the header menu. Enable only where that app is deployed."
   },
   {
     "name": "metadata_modal",
@@ -161,5 +161,11 @@
     "enabled": true,
     "owner": "alyssaguo",
     "description": "Enables using the Vertex AI search application for stat var searches."
+  },
+  {
+    "name": "view_transitions",
+    "enabled": false,
+    "owner": "pablonoel",
+    "description": "Enables cross-document view transitions between DC pages and the same-origin app paths listed in config/base/view_transitions.json. Enable only where those apps are deployed."
   }
 ]

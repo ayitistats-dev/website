@@ -102,13 +102,6 @@ nl:
 svg:
   blocklistFile: []
 
-nodejs:
-  enabled: true
-  apiRoot: "http://website-service:8080"
-  image:
-    tag: ""
-  replicas: 2
-
 cronTesting:
   enabled: true
   webApiRoot: "http://website-service:8080"
@@ -116,3 +109,22 @@ cronTesting:
   enableNodejs: false # temporarily turned down pending nodejs server deprecation
   nodePool: "default-pool"
   schedule: "* * 31 2 *" # invalid day for month -> never run automatically
+
+agentic:
+  enabled: false
+  replicas: 2
+  mcpServerUrl: "https://autopush.api.datacommons.org/mcp"
+  useVertexAi: true
+  cloudLocation: "global"
+  dcApiKeySecret: "mixer-api-key"
+  transcriptHmacSecretName: "agentic-transcript-hmac-secret"
+  modelArmorLocation: "us-central1"
+  discover:
+    enabled: true
+    debugReport: "on"
+    image:
+      tag: ""
+    cpu: "1"
+    memory: "1G"
+    modelArmorTemplateId: "discover-dev"
+    configBucket: "datcom-website-dev-discover-config"

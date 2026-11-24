@@ -45,6 +45,10 @@ namespace:
 serviceAccount:
   name: website-ksa
 
+# Pod and container securityContext (non-root + read-only root filesystem).
+securityContext:
+  enabled: true
+
 ingress:
   name: website-ingress
   ipName: dc-website-ip
@@ -153,3 +157,31 @@ cronTesting:
   nodePool:
   # schedule to run the cron tests on
   schedule:
+
+###############################################################################
+# Config for Agentic Apps (e.g. Discover)
+###############################################################################
+agentic:
+  # Set to false to remove the website-agentic-apps Deployment,
+  # website-agentic-service Service, and agentic Ingress routes completely.
+  enabled: false
+  replicas: 2
+  nodePool:
+  mcpServerUrl: "https://api.datacommons.org/mcp"
+  useVertexAi: true
+  cloudLocation: "global"
+  dcApiKeySecret: "mixer-api-key"
+  transcriptHmacSecretName: "agentic-transcript-hmac-secret"
+  modelArmorLocation: "us-central1"
+  discover:
+    enabled: true
+    basePath: "/labs/discover"
+    # Turn debug panel mode ("off", "flag", or "on"). Quote values so YAML 1.1
+    # does not parse bare on/off as booleans.
+    debugReport: "off"
+    image:
+      tag: ""
+    cpu: "1"
+    memory: "1G"
+    modelArmorTemplateId: ""
+    configBucket: ""
